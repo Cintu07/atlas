@@ -1084,6 +1084,7 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             auto_accept_architect=args.auto_accept_architect,
             add_gitignore_files=args.add_gitignore_files,
             require_approval=args.require_approval,
+            llm_controlled_tools=args.llm_controlled_tools,
         )
     except UnknownEditFormat as err:
         io.tool_error(str(err))

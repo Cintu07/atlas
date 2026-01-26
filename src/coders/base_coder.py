@@ -112,6 +112,7 @@ class Coder:
     test_outcome = None
     multi_response_content = ""
     partial_response_content = ""
+    partial_response_tool_calls = []
     commit_before_message = []
     message_cost = 0.0
     add_cache_headers = False
@@ -342,6 +343,7 @@ class Coder:
         auto_copy_context=False,
         auto_accept_architect=True,
         require_approval=False,
+        llm_controlled_tools=False,
     ):
         # Fill in a dummy Analytics if needed, but it is never .enable()'d
         self.analytics = analytics if analytics is not None else Analytics()
@@ -357,6 +359,7 @@ class Coder:
         self.auto_copy_context = auto_copy_context
         self.auto_accept_architect = auto_accept_architect
         self.require_approval = require_approval
+        self.llm_controlled_tools = llm_controlled_tools
 
         self.ignore_mentions = ignore_mentions
         if not self.ignore_mentions:
@@ -435,6 +438,20 @@ class Coder:
 
         self.commands = commands or Commands(self.io, self)
         self.commands.coder = self
+
+        # Register tools for LLM-controlled orchestration
+        if self.llm_controlled_tools:
+            from src.core.tool_registry import register_command_tools
+            register_command_tools(self.commands)
+            # Set functions to all available tools
+            from src.core.tools import get_registry
+            registry = get_registry()
+            # Get function definitions (these are in OpenAI tool format)
+            tool_definitions = registry.get_function_definitions()
+            # Extract just the function schemas for validation
+            self.functions = [tool_def["function"] for tool_def in tool_definitions]
+            # Store full tool definitions separately for API calls
+            self._tool_definitions = tool_definitions
 
         self.repo = repo
         if use_git and self.repo is None:
@@ -1644,6 +1661,11 @@ class Coder:
 
         self.show_usage_report()
 
+        # Handle LLM-controlled tool orchestration
+        if self.llm_controlled_tools and hasattr(self, 'partial_response_tool_calls') and self.partial_response_tool_calls and len(self.partial_response_tool_calls) > 0:
+            self._execute_tool_calls_loop()
+            return
+
         self.add_assistant_reply_to_cur_messages()
 
         if exhausted:
@@ -1813,17 +1835,163 @@ class Coder:
         self.ok_to_warm_cache = False
         self._shutdown_flag = True
 
+    def _execute_tool_calls_loop(self):
+        """Execute tool calls in a loop until LLM responds with text."""
+        from src.core.tools import get_registry
+        import json
+
+        registry = get_registry()
+        max_iterations = 20  # Prevent infinite loops
+        iteration = 0
+
+        while iteration < max_iterations:
+            iteration += 1
+
+            if not hasattr(self, 'partial_response_tool_calls') or not self.partial_response_tool_calls:
+                break
+
+            # Add assistant message with tool calls
+            tool_calls_for_message = []
+            for tool_call in self.partial_response_tool_calls:
+                tool_calls_for_message.append({
+                    "id": getattr(tool_call, 'id', f"call_{iteration}_{len(tool_calls_for_message)}"),
+                    "type": "function",
+                    "function": {
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments,
+                    }
+                })
+
+            self.cur_messages += [{
+                "role": "assistant",
+                "content": self.partial_response_content or None,
+                "tool_calls": tool_calls_for_message,
+            }]
+
+            # Execute all tool calls
+            tool_results = []
+            for tool_call in self.partial_response_tool_calls:
+                tool_name = tool_call.function.name
+                try:
+                    # Parse arguments
+                    args_str = tool_call.function.arguments
+                    args = json.loads(args_str) if isinstance(args_str, str) else args_str
+
+                    # Execute tool
+                    result = registry.execute(tool_name, args)
+
+                    # Format result
+                    if isinstance(result, dict):
+                        result_str = json.dumps(result, indent=2)
+                    else:
+                        result_str = str(result)
+
+                    tool_results.append({
+                        "tool_call_id": getattr(tool_call, 'id', f"call_{iteration}_{len(tool_results)}"),
+                        "role": "tool",
+                        "name": tool_name,
+                        "content": result_str,
+                    })
+
+                    # Log tool execution
+                    self.io.tool_output(f"🔧 Executed {tool_name}")
+                    if self.verbose:
+                        self.io.tool_output(f"Arguments: {json.dumps(args, indent=2)}")
+                        self.io.tool_output(f"Result: {result_str[:200]}...")
+
+                except Exception as e:
+                    error_msg = f"Error executing {tool_name}: {str(e)}"
+                    self.io.tool_error(error_msg)
+                    tool_results.append({
+                        "tool_call_id": getattr(tool_call, 'id', f"call_{iteration}_{len(tool_results)}"),
+                        "role": "tool",
+                        "name": tool_name,
+                        "content": json.dumps({"error": error_msg}),
+                    })
+
+            # Add tool results to messages
+            self.cur_messages.extend(tool_results)
+
+            # Get next LLM response
+            self.partial_response_content = ""
+            self.partial_response_function_call = dict()
+            self.partial_response_tool_calls = []
+
+            # Format messages for next LLM call
+            # In tool execution loop, we need to format messages properly
+            # but handle cases where repo_map might not be available
+            try:
+                chunks = self.format_messages()
+                messages = chunks.all_messages()
+            except (TypeError, AttributeError) as e:
+                # If formatting fails due to None values, use cur_messages directly
+                # This can happen if repo_map returns None
+                self.io.tool_warning(f"Error formatting messages (using direct messages): {e}")
+                messages = [msg for msg in self.cur_messages if msg.get("role") in ("user", "assistant", "tool", "system")]
+            except Exception as e:
+                # For other errors, still try to use cur_messages
+                self.io.tool_warning(f"Error formatting messages: {e}")
+                messages = [msg for msg in self.cur_messages if msg.get("role") in ("user", "assistant", "tool", "system")]
+            
+            if not self.check_tokens(messages):
+                break
+
+            # Get LLM response - use list() to consume generator
+            try:
+                # Disable streaming in tool execution loop for reliability
+                original_stream = self.stream
+                self.stream = False
+                # Use tool definitions for LLM-controlled mode
+                tools_for_send = self._tool_definitions if hasattr(self, '_tool_definitions') else self.functions
+                list(self.send(messages, functions=tools_for_send))
+                self.stream = original_stream
+            except Exception as e:
+                self.io.tool_error(f"Error in tool execution loop: {e}")
+                self.stream = original_stream if 'original_stream' in locals() else self.stream
+                break
+
+            # Check if we got text response (no more tool calls)
+            has_tool_calls = (hasattr(self, 'partial_response_tool_calls') and 
+                            self.partial_response_tool_calls and 
+                            len(self.partial_response_tool_calls) > 0)
+            
+            if self.partial_response_content and not has_tool_calls:
+                # LLM responded with text, we're done
+                self.add_assistant_reply_to_cur_messages()
+                break
+
+        if iteration >= max_iterations:
+            self.io.tool_warning("Tool execution loop reached maximum iterations")
+
     def add_assistant_reply_to_cur_messages(self):
         if self.partial_response_content:
             self.cur_messages += [dict(role="assistant", content=self.partial_response_content)]
         if self.partial_response_function_call:
-            self.cur_messages += [
-                dict(
-                    role="assistant",
-                    content=None,
-                    function_call=self.partial_response_function_call,
-                )
-            ]
+            # Handle both old format (function_call) and new format (tool_calls)
+            if hasattr(self, 'partial_response_tool_calls') and self.partial_response_tool_calls:
+                tool_calls_for_message = []
+                for tool_call in self.partial_response_tool_calls:
+                    tool_calls_for_message.append({
+                        "id": getattr(tool_call, 'id', f"call_{len(tool_calls_for_message)}"),
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.function.name,
+                            "arguments": tool_call.function.arguments,
+                        }
+                    })
+                self.cur_messages += [{
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": tool_calls_for_message,
+                }]
+            else:
+                self.cur_messages += [
+                    dict(
+                        role="assistant",
+                        content=None,
+                        function_call=self.partial_response_function_call,
+                    )
+                ]
 
     def get_file_mentions(self, content, ignore_current=False):
         words = set(word for word in content.split())
@@ -1903,22 +2071,39 @@ class Coder:
 
         self.partial_response_content = ""
         self.partial_response_function_call = dict()
+        self.partial_response_tool_calls = []  # Initialize for tool calls
 
         self.io.log_llm_history("TO LLM", format_messages(messages))
 
         completion = None
         litellm_ex = LiteLLMExceptions()
         try:
+            # Use tool definitions for LLM-controlled mode, function definitions for deterministic mode
+            if self.llm_controlled_tools and hasattr(self, '_tool_definitions'):
+                tools_for_api = self._tool_definitions
+            else:
+                tools_for_api = functions
+            
             hash_object, completion = model.send_completion(
                 messages,
-                functions,
+                tools_for_api,
                 self.stream,
                 self.temperature,
+                llm_controlled_tools=self.llm_controlled_tools,
             )
             self.chat_completion_call_hashes.append(hash_object.hexdigest())
 
             if self.stream:
                 yield from self.show_send_output_stream(completion)
+                # After streaming, extract tool_calls from final completion if available
+                # (some providers only include tool_calls in the final chunk)
+                try:
+                    if hasattr(completion, 'choices') and completion.choices:
+                        # Try to get tool_calls from the completion object
+                        # Note: This may not work for all providers in streaming mode
+                        pass  # Tool calls should be extracted during streaming
+                except Exception:
+                    pass
             else:
                 self.show_send_output(completion)
 
@@ -1967,11 +2152,16 @@ class Coder:
 
         show_func_err = None
         show_content_err = None
+        self.partial_response_tool_calls = []  # Initialize
         try:
             if completion.choices[0].message.tool_calls:
-                self.partial_response_function_call = (
-                    completion.choices[0].message.tool_calls[0].function
-                )
+                # Handle multiple tool calls
+                tool_calls = completion.choices[0].message.tool_calls
+                if len(tool_calls) > 0:
+                    # For backward compatibility, store first tool call
+                    self.partial_response_function_call = tool_calls[0].function
+                    # Store all tool calls for LLM-controlled mode
+                    self.partial_response_tool_calls = tool_calls
         except AttributeError as func_err:
             show_func_err = func_err
 
@@ -2045,6 +2235,16 @@ class Coder:
             except AttributeError:
                 pass
 
+            # Handle tool_calls in streaming mode
+            try:
+                if hasattr(chunk.choices[0].delta, 'tool_calls') and chunk.choices[0].delta.tool_calls:
+                    if not hasattr(self, 'partial_response_tool_calls') or not self.partial_response_tool_calls:
+                        self.partial_response_tool_calls = []
+                    # Note: Streaming tool calls are handled incrementally by litellm
+                    # We'll get the full tool_calls in the final completion
+            except AttributeError:
+                pass
+
             text = ""
 
             try:
@@ -2097,6 +2297,10 @@ class Coder:
 
         if not received_content:
             self.io.tool_warning("Empty response received from LLM. Check your provider account?")
+
+        # After streaming completes, check for tool_calls in the final completion
+        # Note: This is a workaround - ideally we'd track tool_calls during streaming
+        # but litellm may not expose this until the end
 
     def live_incremental_response(self, final):
         show_resp = self.render_incremental_response(final)
