@@ -314,6 +314,16 @@ def get_parser(default_config_files, git_root):
         help="Enable/disable pretty, colorized output (default: True)",
     )
     group.add_argument(
+        "--llm-controlled-tools",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable LLM-controlled tool orchestration. When enabled, the LLM can choose which tools "
+            "to call (git, web search, etc.) instead of using deterministic orchestration. "
+            "(default: False, uses deterministic mode)"
+        ),
+    )
+    group.add_argument(
         "--stream",
         action=argparse.BooleanOptionalAction,
         default=True,
